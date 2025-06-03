@@ -21,11 +21,12 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from botocore.exceptions import ClientError
 from yt_dlp import YoutubeDL
+from isodate import parse_duration
 
-
-testjsonlist = []
-justSummaries = []
+#testjsonlist = []
+#justSummaries = []
 role_arn = 'arn:aws:iam::440597413354:role/localRole'
+
 
 def is_running_locally():
     # True if NOT in ECS and NOT in Lambda
@@ -79,86 +80,134 @@ deepseek_session.headers.update({
 s3 = session.resource('s3')
 dynamodb = session.resource('dynamodb', region_name='us-east-2')
 
-#tmp_dir = "/tmp"
+# Constants
 tmp_dir = tempfile.gettempdir()
-#LOCAL_COOKIE_PATH = os.path.join(tmp_dir, "youtube.com_cookies.txt")
-# Directory for temporary VTTs (works on EC2 and local)
-TMP_VTT_DIR = os.path.join(tmp_dir, "transcripts")
-os.makedirs(TMP_VTT_DIR, exist_ok=True)
+WEBSHARE_USERNAME = 'nljhrdku'
+WEBSHARE_PASSWORD = 'y62jmm9b4rwr'
+PROXY = "socks5://nljhrdku:y62jmm9b4rwr@207.228.8.73:5159"
 
-def parse_vtt_to_text(vtt_path):
-    lines = []
+def parse_json3_to_text(json3_path):
+    """
+    Parses YouTube's .json3 subtitle format into plain text.
+    """
     try:
-        with open(vtt_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith(('WEBVTT', 'NOTE', 'X-TIMESTAMP', 'STYLE', 'Region:', '00:', 'Kind:', 'Language:', '-->')):
-                    lines.append(line)
+        with open(json3_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        events = data.get("events", [])
+        lines = []
+
+        for event in events:
+            if "segs" in event:
+                seg_texts = [seg.get("utf8", "") for seg in event["segs"] if "utf8" in seg]
+                text = "".join(seg_texts).strip()
+                if text:
+                    lines.append(text)
+
         return " ".join(lines)
+
     except Exception as e:
-        print(f"Failed to parse .vtt file: {e}")
+        print(f"❌ Failed to parse .json3 file: {e}")
         return None
 
-def fetch_transcript_with_ytdlp(video_id):
+def fetch_transcript_with_ytdlp(video_id, tmp_dir, proxy_socks5_url):
+    """
+    Downloads auto-generated subtitles using yt-dlp + SOCKS5 proxy and parses .json3 to text.
+    """
     video_url = f"https://www.youtube.com/watch?v={video_id}"
-    output_path = os.path.join(TMP_VTT_DIR, f"{video_id}.en.vtt")
+    json3_path = os.path.join(tmp_dir, f"{video_id}.en.json3")
+
     try:
-        subprocess.run([
+        result = subprocess.run([
             "yt-dlp",
             "--skip-download",
             "--write-auto-sub",
             "--sub-lang", "en",
-            "--sub-format", "vtt",
-            "-o", os.path.join(TMP_VTT_DIR, f"{video_id}.%(ext)s"),
+            "--sub-format", "json3",
+            "--proxy", proxy_socks5_url,
+            "-o", os.path.join(tmp_dir, f"{video_id}.%(ext)s"),
             video_url
         ], check=True, capture_output=True)
+
+        print(f"✅ yt-dlp success for {video_id}")
     except subprocess.CalledProcessError as e:
-        print(f"yt-dlp failed for {video_id}: {e.stderr.decode()}")
+        print(f"❌ yt-dlp failed for {video_id}: {e.stderr.decode()}")
         return None
 
-    if os.path.exists(output_path):
-        return parse_vtt_to_text(output_path)
+    if os.path.exists(json3_path):
+        parsed = parse_json3_to_text(json3_path)
+        os.remove(json3_path)  # Clean up after parsing
+        return parsed
     else:
-        print(f"No VTT file found for {video_id} after yt-dlp")
+        print(f"❌ No .json3 file found for {video_id} after yt-dlp")
         return None
 
 def get_transcript(video_id):
+    """
+    Attempts to fetch transcript using yt-dlp and falls back to youtube-transcript-api only if needed.
+    """
+    # First attempt yt-dlp with proxy and json3
+    print(f"\n===============>BEGIN VIDEO PROCESSING STAGE <==================")
+    transcript_text = fetch_transcript_with_ytdlp(video_id, tmp_dir, PROXY)
+    if transcript_text:
+        return transcript_text
+
+    # Fallback to YouTubeTranscriptApi using a proxy
+    proxies = {
+        "http": PROXY,
+        "https": PROXY,
+    }
+    original_get = requests.get
+
+    def proxied_get(url, **kwargs):
+        kwargs['proxies'] = proxies
+        kwargs['headers'] = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Referer": "https://www.youtube.com/"
+        }
+        return original_get(url, **kwargs)
+
+    requests.get = proxied_get
+
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript_list = YouTubeTranscriptApi().list_transcripts(video_id)
+    except Exception as e:
+        print(f"❌ list_transcripts failed for {video_id}: {e}")
+        requests.get = original_get
+        return None
 
-        # 1. Manual EN
-        try:
-            transcript = transcript_list.find_transcript(['en'])
-            print(f"Manual English transcript found for video_id {video_id}")
-            return " ".join([entry.text for entry in transcript.fetch()])
-        except (NoTranscriptFound, ParseError, Exception) as e:
-            print(f"Manual transcript failed for {video_id}: {e}")
+    requests.get = original_get
 
-        # 2. Auto-generated EN
+    # Try getting an English transcript
+    transcript = None
+    try:
+        transcript = transcript_list.find_transcript(['en'])
+        print(f"✅ Manual EN transcript for {video_id}")
+    except:
         try:
             transcript = transcript_list.find_generated_transcript(['en'])
-            print(f"Auto-generated English transcript found for video_id {video_id}")
-            return " ".join([entry.text for entry in transcript.fetch()])
-        except (NoTranscriptFound, ParseError, Exception) as e:
-            print(f"Auto-generated transcript failed for {video_id}: {e}")
-
-        # 3. Translated to EN
-        try:
+            print(f"✅ Auto-generated EN transcript for {video_id}")
+        except:
             for t in transcript_list:
                 if t.is_translatable and 'en' in [lang.language_code for lang in t.translation_languages]:
-                    print(f"Translating transcript from {t.language_code} to en for video_id {video_id}")
-                    translated = t.translate('en')
-                    return " ".join([entry.text for entry in translated.fetch()])
-        except (ParseError, Exception) as e:
-            print(f"Translated transcript failed for {video_id}: {e}")
+                    print(f"🔄 Translating transcript from {t.language_code} to en")
+                    transcript = t.translate('en')
+                    break
 
-        print(f"No usable YouTube API transcript found for {video_id}. Trying yt-dlp fallback...")
+    if not transcript:
+        print(f"❌ No usable transcript found for {video_id}")
+        return None
 
-    except (TranscriptsDisabled, VideoUnavailable, Exception) as e:
-        print(f"Transcript API failed for {video_id}: {e}")
-
-    # Fallback to yt-dlp + .vtt
-    return fetch_transcript_with_ytdlp(video_id)
+    # Try fetching and parsing transcript
+    try:
+        fetched = transcript.fetch()
+        texts = [entry.text for entry in fetched if hasattr(entry, 'text')]
+        return " ".join(texts) if texts else None
+    except Exception as e:
+        print(f"❌ Final fetch failed for {video_id}: {e}")
+        return None
 
 
 #text parameter is the raw transcript, not the full formatted prompt.
@@ -566,63 +615,105 @@ def videoid_exists(video_id, table):
         print(f"Error checking video: {e}")
         return False
 
+def is_valid_youtube_video(item):
+    """Filter out livestreams, shorts, and podcast-like titles."""
+    snippet = item.get("snippet", {})
+    content_details = item.get("contentDetails", {})
 
-#50 channels, 3 recent videos per channel, every hour You do not need extract_flat=True
-#Use extract_flat=True only if You need to fetch 20+ videos per channel
-def get_recent_videos_from_channel_non_shorts(channel_url):
+    # SKIP Livestreams + Upcoming Videos
+    if snippet.get("liveBroadcastContent") in ("live", "upcoming"):
+        return False
 
-    max_results = 2
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": False,  # fetch full metadata
-        "playlistend": max_results,  # limit how many videos to fetch
-        "skip_download": True,
-        "socket_timeout": 10,
-        "retries": 1,
-        #"cookies": LOCAL_COOKIE_PATH, #Reference cookie created from download_cookie_from_s3 method
-        "no_warnings": True
+    # SKIP Shorts
+    try:
+        duration = content_details.get("duration", "PT0S")
+        if parse_duration(duration).total_seconds() <= 60:
+            return False
+    except Exception:
+        return False
+
+    # Optional: Filter podcast-like titles
+    title = snippet.get("title", "").lower()
+    if "podcast" in title:
+        return False
+
+    return True
+
+
+YOUTUBE_API_KEYS = [
+    "AIzaSyBsJ6lKZmXxeabhGTVv-68AMoYrgT5Ri6U",
+    "AIzaSyDZuewBaLxsJzkt3Z7tvbpQCCHEpxnObHg",
+    "AIzaSyDjcSlBDs5XzpDIlrZ6gAsuq76Pu-3UnEw",
+    "AIzaSyCfGn30LmlH0HRBYclJGQgHXFucOCs9LyI",
+    "AIzaSyBrPMXXSEmSAqj3OnsKH6evTQ190uJiCjA"
+]
+
+def get_rotating_api_key():
+    return random.choice(YOUTUBE_API_KEYS)
+
+def get_recent_videos_from_channel_non_shorts(channel_id):
+    api_key = get_rotating_api_key()
+
+    # Step 1: search.list – fetch top 3 most recent videos
+    search_url = "https://www.googleapis.com/youtube/v3/search"
+    search_params = {
+        "part": "id",
+        "channelId": channel_id,
+        "order": "date",
+        "maxResults": 2,
+        "type": "video",
+        "key": api_key
     }
 
+    search_resp = requests.get(search_url, params=search_params)
+    if search_resp.status_code != 200:
+        print(f"search.list failed: {search_resp.text}")
+        return []
+
+    items = search_resp.json().get("items", [])
+    video_ids = [item["id"]["videoId"] for item in items if "videoId" in item.get("id", {})]
+    if not video_ids:
+        print("No recent videos found.")
+        return []
+
+    # Step 2: videos.list – fetch full metadata
+    video_url = "https://www.googleapis.com/youtube/v3/videos"
+    video_params = {
+        "part": "snippet,contentDetails",
+        "id": ",".join(video_ids),
+        "key": api_key
+    }
+
+    video_resp = requests.get(video_url, params=video_params)
+    if video_resp.status_code != 200:
+        print(f"videos.list failed: {video_resp.text}")
+        return []
+
     results = []
-
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"{channel_url}/videos", download=False)
-            entries = info.get("entries", [])
-            time.sleep(random.uniform(0.5, 2))  # delay to avoid rate-limit
-    except Exception as e:
-        print(f"Failed to fetch video list from {channel_url}: {e}")
-        return results
-
-    for entry in entries:
-        if entry.get("is_live") or entry.get("live_status") in ("is_live", "upcoming"):
-            continue
-        if "/shorts/" in entry.get("webpage_url", ""):
+    for item in video_resp.json().get("items", []):
+        if not is_valid_youtube_video(item):
             continue
 
-        upload_date_str = entry.get("upload_date")
-        if not upload_date_str:
-            continue
-
-        try:
-            published_at = datetime.strptime(upload_date_str, "%Y%m%d").replace(tzinfo=timezone.utc).isoformat()
-        except ValueError:
-            continue
+        snippet = item["snippet"]
+        video_id = item["id"]
+        title = snippet.get("title")
+        published_at = snippet.get("publishedAt")
+        url = f"https://www.youtube.com/watch?v={video_id}"
 
         results.append({
-            "video_id": entry["id"],
-            "title": entry["title"],
-            "url": entry["webpage_url"],
+            "video_id": video_id,
+            "title": title,
+            "url": url,
             "published_at": published_at
         })
 
     return results
 
 #Fetches recent non-Shorts YouTube videos (not livestreams or Shorts) from a channel’s /videos page, filtering by upload date (last N days).
+#Not to be used for fargate usage. Used to load new channel.
+#Here I use yt_dlp because It will not cost youtube API Data.
+#Yt_dlp does not work with rotating proxy because I have to pay for https
 def get_recent_non_shorts_by_date(channel_url, number_of_days):
-    #LOCAL_PATH = "/tmp/youtube.com_cookies.txt"
-    #This is not really needed for prod job
 
     print(f"get_recent_non_shorts_by_date called: {channel_url}")
     cutoff = datetime.now() - timedelta(days=number_of_days)
@@ -660,7 +751,7 @@ def get_recent_non_shorts_by_date(channel_url, number_of_days):
 
         try:
             print(f"[{i+1}/{len(entries)}] Fetching: {entry['url']}")
-            time.sleep(random.uniform(1.5, 3.0))  # delay to avoid rate-limit
+            time.sleep(random.uniform(3, 5))  # delay to avoid rate-limit
 
             ydl_opts_full = {
                 "quiet": True,
@@ -755,10 +846,14 @@ def ingest_channel(channel_id, handle, fetchByTopVideos, fetchBynumberOfDays, co
     url = "https://www.youtube.com/" + handle
     print(f"--------------------------------channel: {handle} begin. count:{count}/{total}--------------------------------")
     if(fetchByTopVideos):
-        videos = get_recent_videos_from_channel_non_shorts(url)
+        #for youtubedataAPI, pass channel_id
+        videos = get_recent_videos_from_channel_non_shorts(channel_id)
     else:
         videos = get_recent_non_shorts_by_date(url, fetchBynumberOfDays)
    
+    if not videos:
+        print(f"get recent videos from channel failed.")
+        return None
 
     # Initialize DynamoDB resource
     videoIdTable = dynamodb.Table('video_id_table')
@@ -766,7 +861,9 @@ def ingest_channel(channel_id, handle, fetchByTopVideos, fetchBynumberOfDays, co
     publishAtTable = dynamodb.Table('published_at_table')
     
     print(f"Looping over videos for channel: {handle} ")
+
     for video in videos:
+        time.sleep(random.uniform(1.5, 3.0))
         video_id=video['video_id']
         title = video['title']
 
@@ -812,8 +909,7 @@ def ingest_channel(channel_id, handle, fetchByTopVideos, fetchBynumberOfDays, co
             store_videoid_to_dynamoDB(video_id, published_at, channel_id, title, handle, videoIdTable)
             store_published_at_to_dynamoDB(video_id, published_at, channel_id, title, handle, publishAtTable)
             store_channelid_withsortkey_to_dynamoDB(channel_id, published_at, video_id, title, handle, channelIdTable)
-            print(f"===============>END VIDEO PROCESSING STAGE <==================")
-
+            
             '''
             testjson = {
                 'channel_id': channel_id,
@@ -850,6 +946,7 @@ def run_ingestion_job(event, context):
     #fetchByTopVideos = body.get("fetchByTopVideos")
     #fetchBynumberOfDays = body.get("fetchBynumberOfDays")
 
+    print(f"Version4 start")
     fetchByTopVideos = True
     fetchBynumberOfDays = -1
     channel_ids = []
@@ -897,7 +994,7 @@ def run_ingestion_job(event, context):
         count += 1
 
     
-    current_timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    #current_timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     #save_test_data_to_s3(testjsonlist, 'transcript_prefilter_formatted', False, current_timestamp)
     #save_test_data_to_s3(justSummaries, 'all_formatted_summaries', True, current_timestamp)
     return {
