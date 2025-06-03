@@ -946,7 +946,7 @@ def run_ingestion_job(event, context):
     #fetchByTopVideos = body.get("fetchByTopVideos")
     #fetchBynumberOfDays = body.get("fetchBynumberOfDays")
 
-    print(f"Version4 start")
+    print(f"Version5 start")
     fetchByTopVideos = True
     fetchBynumberOfDays = -1
     channel_ids = []
