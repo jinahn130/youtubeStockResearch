@@ -38,10 +38,17 @@ if is_running_locally():
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
     YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+    WEBSHARE_USERNAME=os.getenv("WEBSHARE_USERNAME")
+    WEBSHARE_PASSWORD=os.getenv("WEBSHARE_PASSWORD")
+    YOUTUBE_API_KEYS = json.loads(os.getenv("YOUTUBE_API_KEYS", "[]"))
 else:
     OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
     DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
     YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+    WEBSHARE_USERNAME=os.getenv("WEBSHARE_USERNAME")
+    WEBSHARE_PASSWORD=os.getenv("WEBSHARE_PASSWORD")
+    YOUTUBE_API_KEYS = json.loads(os.getenv("YOUTUBE_API_KEYS", "[]"))
+
 
 def get_boto3_session():
     if is_running_locally():
@@ -84,6 +91,9 @@ dynamodb = session.resource('dynamodb', region_name='us-east-2')
 tmp_dir = tempfile.gettempdir()
 WEBSHARE_USERNAME = 'nljhrdku'
 WEBSHARE_PASSWORD = 'y62jmm9b4rwr'
+
+os.environ["WEBSHARE_USERNAME"]
+os.environ["WEBSHARE_PASSWORD"]
 PROXY = "socks5://nljhrdku:y62jmm9b4rwr@207.228.8.73:5159"
 
 def parse_json3_to_text(json3_path):
@@ -657,14 +667,6 @@ def is_valid_youtube_video(item):
 
     return True
 
-
-YOUTUBE_API_KEYS = [
-    "AIzaSyBsJ6lKZmXxeabhGTVv-68AMoYrgT5Ri6U",
-    "AIzaSyDZuewBaLxsJzkt3Z7tvbpQCCHEpxnObHg",
-    "AIzaSyDjcSlBDs5XzpDIlrZ6gAsuq76Pu-3UnEw",
-    "AIzaSyCfGn30LmlH0HRBYclJGQgHXFucOCs9LyI",
-    "AIzaSyBrPMXXSEmSAqj3OnsKH6evTQ190uJiCjA"
-]
 
 def get_rotating_api_key():
     return random.choice(YOUTUBE_API_KEYS)
