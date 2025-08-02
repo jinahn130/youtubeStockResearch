@@ -89,11 +89,7 @@ dynamodb = session.resource('dynamodb', region_name='us-east-2')
 
 # Constants
 tmp_dir = tempfile.gettempdir()
-WEBSHARE_USERNAME = 'nljhrdku'
-WEBSHARE_PASSWORD = 'y62jmm9b4rwr'
 
-os.environ["WEBSHARE_USERNAME"]
-os.environ["WEBSHARE_PASSWORD"]
 PROXY = "socks5://nljhrdku:y62jmm9b4rwr@207.228.8.73:5159"
 
 def parse_json3_to_text(json3_path):
