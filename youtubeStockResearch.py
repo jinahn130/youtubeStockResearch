@@ -21,11 +21,12 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from botocore.exceptions import ClientError
 from yt_dlp import YoutubeDL
+from isodate import parse_duration
 
-
-testjsonlist = []
-justSummaries = []
+#testjsonlist = []
+#justSummaries = []
 role_arn = 'arn:aws:iam::440597413354:role/localRole'
+
 
 def is_running_locally():
     # True if NOT in ECS and NOT in Lambda
@@ -79,86 +80,150 @@ deepseek_session.headers.update({
 s3 = session.resource('s3')
 dynamodb = session.resource('dynamodb', region_name='us-east-2')
 
-#tmp_dir = "/tmp"
+# Constants
 tmp_dir = tempfile.gettempdir()
-#LOCAL_COOKIE_PATH = os.path.join(tmp_dir, "youtube.com_cookies.txt")
-# Directory for temporary VTTs (works on EC2 and local)
-TMP_VTT_DIR = os.path.join(tmp_dir, "transcripts")
-os.makedirs(TMP_VTT_DIR, exist_ok=True)
+WEBSHARE_USERNAME = 'nljhrdku'
+WEBSHARE_PASSWORD = 'y62jmm9b4rwr'
+PROXY = "socks5://nljhrdku:y62jmm9b4rwr@207.228.8.73:5159"
 
-def parse_vtt_to_text(vtt_path):
-    lines = []
+def parse_json3_to_text(json3_path):
+    """
+    Parses YouTube's .json3 subtitle format into plain text.
+    """
     try:
-        with open(vtt_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith(('WEBVTT', 'NOTE', 'X-TIMESTAMP', 'STYLE', 'Region:', '00:', 'Kind:', 'Language:', '-->')):
-                    lines.append(line)
+        with open(json3_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        events = data.get("events", [])
+        lines = []
+
+        for event in events:
+            if "segs" in event:
+                seg_texts = [seg.get("utf8", "") for seg in event["segs"] if "utf8" in seg]
+                text = "".join(seg_texts).strip()
+                if text:
+                    lines.append(text)
+
         return " ".join(lines)
+
     except Exception as e:
-        print(f"Failed to parse .vtt file: {e}")
+        print(f"❌ Failed to parse .json3 file: {e}")
         return None
 
-def fetch_transcript_with_ytdlp(video_id):
+def fetch_transcript_with_ytdlp(video_id, tmp_dir, proxy_socks5_url):
+    """
+    Downloads auto-generated subtitles using yt-dlp + SOCKS5 proxy and parses .json3 to text.
+    """
     video_url = f"https://www.youtube.com/watch?v={video_id}"
-    output_path = os.path.join(TMP_VTT_DIR, f"{video_id}.en.vtt")
+    json3_path = os.path.join(tmp_dir, f"{video_id}.en.json3")
+
     try:
-        subprocess.run([
+        result = subprocess.run([
             "yt-dlp",
             "--skip-download",
             "--write-auto-sub",
             "--sub-lang", "en",
-            "--sub-format", "vtt",
-            "-o", os.path.join(TMP_VTT_DIR, f"{video_id}.%(ext)s"),
+            "--sub-format", "json3",
+            "--proxy", proxy_socks5_url,
+            "-o", os.path.join(tmp_dir, f"{video_id}.%(ext)s"),
             video_url
-        ], check=True, capture_output=True)
+        ], check=True, capture_output=True, timeout=300)
+
+        print(f"✅ yt-dlp success for {video_id}")
     except subprocess.CalledProcessError as e:
-        print(f"yt-dlp failed for {video_id}: {e.stderr.decode()}")
+        print(f"❌ yt-dlp failed for {video_id}: {e.stderr.decode()}")
         return None
 
-    if os.path.exists(output_path):
-        return parse_vtt_to_text(output_path)
+    if os.path.exists(json3_path):
+        parsed = parse_json3_to_text(json3_path)
+        os.remove(json3_path)  # Clean up after parsing
+        return parsed
     else:
-        print(f"No VTT file found for {video_id} after yt-dlp")
+        print(f"❌ No .json3 file found for {video_id} after yt-dlp")
         return None
 
 def get_transcript(video_id):
+    """
+    Attempts to fetch transcript using yt-dlp and falls back to youtube-transcript-api only if needed.
+    """
+    # First attempt yt-dlp with proxy and json3
+    transcript_text = fetch_transcript_with_ytdlp(video_id, tmp_dir, PROXY)
+    if transcript_text:
+        return transcript_text
+
+    print(f"JIN: Attempt with yt-dlp failed so trying youtube-transcript-api now")
+
+    # Fallback to YouTubeTranscriptApi using a proxy
+    
+    #You're monkey-patching requests.get, which means you're temporarily replacing it at runtime with your own custom version (proxied_get). This is a common trick to inject custom behavior — like adding a proxy or timeout — without modifying the original library’s source code or the calling library (like youtube-transcript-api).
+    #You're setting up a dictionary to configure your SOCKS5 or HTTP proxy for all outbound HTTP/S requests.
+    proxies = {
+        "http": PROXY,
+        "https": PROXY,
+    }
+
+    #Save the original requests.get:
+    original_get = requests.get
+
+    # Define a custom proxied_get:
+    def proxied_get(url, **kwargs):
+        kwargs['proxies'] = proxies
+        kwargs['headers'] = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/123.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Referer": "https://www.youtube.com/"
+        }
+        kwargs['timeout'] = 300
+        return original_get(url, **kwargs)
+
+    #Monkey-patch it:
+    #From this point onward, any call to requests.get(...) in your process — including ones from third-party libraries — will now go through your proxied_get function.
+    #youtube-transcript-api does not create its own instance of requests.get. It directly imports and calls the requests.get function from the global requests module.
+    requests.get = proxied_get
+
+    #The youtube-transcript-api package internally uses requests.get(...), but:
+    #It doesn't let you specify a proxy directly
+    #It doesn't let you inject headers or timeout easily
+    #You monkey patch to look like a real browser, time out properly.
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript_list = YouTubeTranscriptApi().list_transcripts(video_id)
+        print(f"using youtubetranscript API success after yt_dlp failing for {video_id}")
+    except Exception as e:
+        print(f"Using YoutubeTrasncrtApi -> ❌ list_transcripts failed for {video_id}: {e}")
+        requests.get = original_get
+        return None
 
-        # 1. Manual EN
-        try:
-            transcript = transcript_list.find_transcript(['en'])
-            print(f"Manual English transcript found for video_id {video_id}")
-            return " ".join([entry.text for entry in transcript.fetch()])
-        except (NoTranscriptFound, ParseError, Exception) as e:
-            print(f"Manual transcript failed for {video_id}: {e}")
+    requests.get = original_get
 
-        # 2. Auto-generated EN
+    # Try getting an English transcript
+    transcript = None
+    try:
+        transcript = transcript_list.find_transcript(['en'])
+        print(f"✅ Manual EN transcript for {video_id}")
+    except:
         try:
             transcript = transcript_list.find_generated_transcript(['en'])
-            print(f"Auto-generated English transcript found for video_id {video_id}")
-            return " ".join([entry.text for entry in transcript.fetch()])
-        except (NoTranscriptFound, ParseError, Exception) as e:
-            print(f"Auto-generated transcript failed for {video_id}: {e}")
-
-        # 3. Translated to EN
-        try:
+            print(f"✅ Auto-generated EN transcript for {video_id}")
+        except:
             for t in transcript_list:
                 if t.is_translatable and 'en' in [lang.language_code for lang in t.translation_languages]:
-                    print(f"Translating transcript from {t.language_code} to en for video_id {video_id}")
-                    translated = t.translate('en')
-                    return " ".join([entry.text for entry in translated.fetch()])
-        except (ParseError, Exception) as e:
-            print(f"Translated transcript failed for {video_id}: {e}")
+                    print(f"🔄 Translating transcript from {t.language_code} to en")
+                    transcript = t.translate('en')
+                    break
 
-        print(f"No usable YouTube API transcript found for {video_id}. Trying yt-dlp fallback...")
+    if not transcript:
+        print(f"❌ No usable transcript found for {video_id}")
+        return None
 
-    except (TranscriptsDisabled, VideoUnavailable, Exception) as e:
-        print(f"Transcript API failed for {video_id}: {e}")
-
-    # Fallback to yt-dlp + .vtt
-    return fetch_transcript_with_ytdlp(video_id)
+    # Try fetching and parsing transcript
+    try:
+        fetched = transcript.fetch()
+        texts = [entry.text for entry in fetched if hasattr(entry, 'text')]
+        return " ".join(texts) if texts else None
+    except Exception as e:
+        print(f"❌ Final fetch failed for {video_id}: {e}")
+        return None
 
 
 #text parameter is the raw transcript, not the full formatted prompt.
@@ -167,15 +232,12 @@ def prefilter_transcript_in_gpt(transcript, channel_id, title, url, published_at
     current_timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
 
     prompt = f"""
-    You are an analyst assistant. Prefilter the following transcript from a finance or investing YouTube channel by removing all content not directly relevant to:
-
-    - Investment decisions  
-    - Financial markets  
-    - Economic trends  
-    - Geopolitical events  
-    - Company-specific financial performance
+    You are a professional analyst assistant tasked with preparing clean, investment-focused summaries from finance-related YouTube transcripts. Your job is to filter out noise and retain only high-quality information suitable for institutional investors or research briefs.
 
     ---
+
+    📌 **Transcript Context**  
+    The following transcript comes from a financial or investing-focused YouTube video. It may contain casual commentary, vague references, or poorly transcribed text. Your task is to isolate only the segments that provide genuine investment insight or data.
 
     YouTuber Information:
     - Video Title: {title}
@@ -184,53 +246,99 @@ def prefilter_transcript_in_gpt(transcript, channel_id, title, url, published_at
 
     ---
 
-    **Requirements**  
-    - Do not include any setup, meta-commentary, or casual transitions.  
-    - Output must be clean, professionally written, and suitable for publication or investor review.  
-    - Prioritize **depth and context** over brevity. Preserve all investment-relevant substance.  
-    - Avoid casual tone; do not mimic slang or informal speech.  
-    - Do not mention yourself or the transcript process.
+    🔍 **Inclusion Criteria — Preserve Content That Directly Relates to:**
+
+    - Investment decisions and rationales  
+    - Financial market activity and investor sentiment  
+    - Economic indicators and macro trends  
+    - Company financials: earnings, guidance, cash flow, margins  
+    - Geopolitical developments with market impact  
+    - Industry or sector trends: regulation, AI, technology shifts, supply chains  
+    - Microeconomic data: pricing, demand/supply, consumer behavior  
+    - M&A, litigation, share buybacks, cost structure changes  
+    - Timing or strategy advice around specific stocks or sectors  
+    - If a prediction or investment idea is conditional ("if X happens, then Y"), retain the full chain, including the condition
 
     ---
 
-    **Retain and emphasize:**  
-    - Company metrics: earnings, revenue, margins, forecasts, cash flow  
-    - Stock commentary: valuation, performance, growth outlook  
-    - Market sentiment and macroeconomic indicators  
-    - Investment news: buybacks, regulations, AI investments, M&A, litigation, cost shifts, disasters, politics  
-    - Trends in tech, global economics, or geopolitics  
-    - Microeconomic signals: pricing, demand/supply shifts, consumer behavior  
-    - Logical investment arguments and coherent personal insights  
-    - Investment strategy, timing, and stock picks (with justification)
+    🚫 **Exclusion Criteria — Remove:**
+
+    - Personal stories (unless directly tied to an investment insight)  
+    - Casual banter, jokes, motivational or emotional appeals  
+    - Setup commentary, disclaimers, or channel branding  
+    - Entertainment, slang, or metaphors with no financial meaning  
+    - Repeated phrases or filler (e.g., "you guys", "as always", "let me tell you")  
+    - Do not interpret analogies or metaphors into financial conclusions  
+      - E.g., “this stock is a rocket ship” must not be translated into “bullish trend”
 
     ---
 
-    **Exclude:**  
-    - Personal stories (unless clearly investment-linked)  
-    - Humor, filler, casual banter  
-    - Motivational speeches or entertainment content with no financial implication
+    📊 **Numerical Data Policy:**
+
+    - ✅ Only include prices, returns, earnings, and financial figures if:
+      - Clearly stated in the transcript
+      - Accompanied by units (e.g., "$", "%", "bps", "per share")
+      - Contextually understood (e.g., “$244 price target for Apple”)
+
+    - ❌ Do **not** infer or back-calculate values  
+      - Example: “10% upside to 244” does **not** imply a 222.6 starting price unless explicitly stated  
+      - Do **not** complete or guess values if part is missing
+
+    - ❌ Do **not** auto-interpret shorthand references  
+      - E.g., quote vague phrases like “the 800 zone” as-is unless clearly defined  
+      - Do not convert such phrases into numerical ranges or implications
+
+    - ❌ Do **not** assume temporal context  
+      - Phrases like “this week” or “today’s CPI” must remain verbatim unless exact dates are provided
 
     ---
 
-    **Formatting Rules**  
-    - Organize content in the same order as the transcript  
-    - Use clean markdown (headings, bullet points) where appropriate  
-    - Ensure UTF-8 output that renders cleanly across platforms  
-    - Only preserve tone when it helps explain a financial viewpoint
+    ⚠️ **Handling Ambiguity and Transcript Errors:**
+
+    - If the statement is unclear, potentially mistranscribed, or lacks context:
+      - Use bracketed tags like `[unclear]`, `[possible transcription error]`, or `[unit not specified]`  
+      - Never translate vague talk into formal finance language without full clarity
+
+    - Do not rephrase ambiguous or speculative statements to sound definitive  
+      - Preserve hedging words like “might”, “could”, or “possibly” as-is  
+      - Avoid converting ambiguity into polished or confident assertions
+
+    - Do not correct, clean up, or “fill in” errors unless meaning is completely unambiguous
+    - Only include technical indicators like moving averages or RSI if the speaker clearly explains their relevance to a trading decision; do not summarize or interpret them on your own.
+    ---
+
+    📐 **Formatting Rules:**
+
+    - Output must be logically ordered to follow the transcript  
+    - Use clean markdown: headings (`###`), bullet points, and line breaks for readability  
+    - Ensure valid UTF-8 encoding that renders cleanly across systems  
+    - Do not mimic the speaker’s tone unless it contributes directly to investment reasoning  
+    - Maintain a professional and neutral tone throughout
 
     ---
 
-    **Best Practices**  
-    - Extract and clarify the YouTuber’s strongest arguments  
-    - Aggregate insights where useful for supporting investment logic  
-    - Do not reduce the richness of nuanced reasoning in favor of brevity
+    🧠 **Best Practices:**
+
+    - Preserve every insight or reasoning chain with investment value  
+    - Extract multi-step logic or forecast assumptions even if buried in casual phrasing  
+    - You may consolidate closely related insights for clarity — but do not rearrange transcript order  
+    - Never sacrifice precision or transcript fidelity for easier readability  
+    - Do **not** rewrite or overclean statements into polished analyst prose if they were casual but still clear in the original  
+    - Only group related insights if they occur sequentially and share a logical connection  
+      - Never merge distant or unrelated points even for clarity
 
     ---
 
-    **Begin transcript:**  
+    🎯 **Objective Recap**  
+    Your output should read like a prefiltered analyst-grade summary for an investor audience — accurate, noise-free, and laser-focused on capital markets relevance. No entertainment, no speculation, no inference. Prioritize source fidelity, investment depth, and clarity.
+
+    ---
+
+    **Begin transcript:**
 
     {transcript}
     """
+
 
         
     try:
@@ -249,48 +357,7 @@ def prefilter_transcript_in_deepseek(transcript, channel_id, title, url, publish
     deepSeekurl = "https://api.deepseek.com/v1/chat/completions"
     temperature = 0.3
     
-    prompt = f"""You are an analyst assistant. Prefilter the following transcript from a finance or investing YouTube channel to remove any content not directly relevant to investment decisions, financial markets, economic trends, geopolitical events, or company-specific financial performance.
-
-    YouTuber Information:
-    - Video Title: {title}
-    - Channel URL: {url}
-    - Video Timestamp: {published_at}
-
-    Requirements:
-    - Do not include any setup, meta-commentary, or explanations. Just return a clean, professionally formatted, customer-ready summary.
-    - Maximize **quality over simplicity**. Output should include detailed analysis, explanations, and quotes from the YouTuber where appropriate.
-    - Maximize **output context length**. Preserving as much useful information as possible is more important than minimizing processing cost.
-    - Do not quote or mimic casual or informal language from the transcript.
-
-    Focus on retaining:
-    - Company earnings, revenue, margins, cash flow, forecasts, and other financial metrics
-    - Commentary on stock performance, valuation, and growth outlook
-    - Market sentiment and macroeconomic indicators
-    - News or developments that influence financial decisions (e.g., buybacks, regulations, AI investments, M&A, legal risks, technological shifts, cost changes, natural disasters, political conflict)
-    - References to broader tech, geopolitical, or global economic trends
-    - Personal opinions, advice, or commentary **only if** they support investment reasoning
-    - Mentions of current best practices, emerging trends, or changes in market structure and climate
-    - Microeconomic indicators, especially shifts in supply and demand, price changes, and consumer preferences
-    - Broader contextual information, themes, insights, arguments, or reasoning about changes in the market
-    - Investment recommendations (e.g., stocks to buy) and strategy discussion
-    - Personal opinions (short- or long-term), as long as they are coherent, consistent, and potentially useful for people learning how to invest
-
-    Remove:
-    - Personal stories unless clearly linked to investment outcomes
-    - Humor, sarcasm, casual banter
-    - Speculative or entertainment content with no financial implication
-
-    Formatting:
-    - Structure the output clearly, in the order of the original transcript
-    - Use headings or bullet points where appropriate
-    - Ensure the text is UTF-8 compatible and only uses markdown characters that are unlikely to break across platforms
-    - Maintain the speaker's tone and intent **only where it helps interpret investment insight**
-
-    Best Practices:
-    - Identify strong arguments made in the transcript
-    - Aggregate contextual and relevant information from the transcript to reinforce or highlight the author’s claims
-
-    Begin transcript below:
+    prompt = f"""
     {transcript}
     """
 
@@ -329,27 +396,6 @@ def reconstruct_prefilteredSummary_in_deepseek(text, channel_id, title, url, pub
     current_timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
 
     prompt = f"""
-    You are an expert financial auditor reviewing an AI-generated summary of a YouTube investment and finance advisor and educator's transcript. Your task is to professionally format the summary and correct any factual errors using reliable financial sources available as of today’s date (e.g., SEC filings, Nasdaq Earnings Calendar, reputable financial news).
-
-    Today's date: {current_timestamp}
-
-    Youtuber information:
-    video title:{title}
-    channel url:{url}
-    video timestamp:{published_at}
-
-    Requirements:
-    - Do not add or infer any new investment ideas, companies, or financial data not already present in the summary.
-    - Use today’s date and video posted date as the reference point for verification
-    - Correct and verify the information already present (e.g., company names, fiscal quarters, financial metrics, economic indicators) for factual accuracy.
-    - Apply clean, professional formatting suitable for client delivery (e.g., headings, bullet points, financial language).
-    - Do not include commentary, explanations, or any content outside the revised summary.
-        e.g., no codefences like ``` or introduction like Here is the professionally formatted and fact-checked summary:
-    - Do not cite the sources used to verify facts.
-
-    Avoid including any setup, meta-commentary, or explanations. Just return a clean, professionally formatted, customer-ready summary.
-    
-    Below is the summary:
     {text}
     """
 
@@ -386,29 +432,50 @@ def reconstruct_prefilteredSummary_in_gpt(text, channel_id, title, published_at,
 
     current_timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     prompt = f"""
-    You are an expert financial auditor reviewing an AI-generated summary of a YouTube investment and finance advisor and educator's transcript. Your task is to professionally format the summary and correct any factual errors using reliable financial sources available as of today’s date (e.g., SEC filings, Nasdaq Earnings Calendar, reputable financial news).
+    You are a compliance-grade financial auditor reviewing an AI-generated summary of a YouTube finance video. 
+    Your job is to format the summary cleanly and correct only internal inconsistencies, using **only** the information already present.
 
-    Today's date: {current_timestamp}
+    YouTube Video Information:
+    - Video Title: {title}
+    - Channel URL: {url}
+    - Video Timestamp: {published_at}
 
-    Youtuber information:
-    video title:{title}
-    channel url:{url}
-    video timestamp:{published_at}
+    ### 🔒 DO NOT:
+    - Do NOT use external data, prior knowledge, or assumptions under any circumstances.
+    - Do NOT hallucinate or interpolate numbers such as stock prices, returns, price targets, or economic data.
+    - Do NOT convert vague references (e.g., “the $800 zone”) into concrete ranges or specific figures.
+    - Do NOT improve or complete incomplete data (e.g., “10% upside” must **not** imply a base price).
+    - Do NOT reword hedged or uncertain statements into definitive claims.
 
-    Requirements:
-    - Do not add or infer any new investment ideas, companies, or financial data not already present in the summary.
-    - Use today’s date and video posted date as the reference point for verification
-    - Correct and verify the information already present (e.g., company names, fiscal quarters, financial metrics, economic indicators) for factual accuracy.
-    - Apply clean, professional formatting suitable for client delivery (e.g., headings, bullet points, financial language).
-    - Do not include commentary, explanations, or any content outside the revised summary.
-        e.g., no codefences like ``` or introduction like Here is the professionally formatted and fact-checked summary:
-    - Do not cite the sources used to verify facts.
+    ### ✅ DO:
+    - Preserve original phrasing when data is ambiguous, vague, or incomplete.
+    - Insert explicit audit tags where needed:
+      - `[price not stated]`
+      - `[value unclear]`
+      - `[unit missing]`
+      - `[ambiguous timeframe]`
+      - `[transcription unclear]`
 
-    Avoid including any setup, meta-commentary, or explanations. Just return a clean, professionally formatted, customer-ready summary.
-    
-    Below is the summary:
+    - Correct math, percentages, or inconsistencies **only if the correct value is deducible from the summary or transcript itself**.
+    - Format the summary using clean, professional markdown:
+      - Use `###` for section headings, bullet points, consistent spacing.
+
+    ### ⚠️ Examples:
+
+    - ❌ “NVDA will hit $244” ← do NOT insert the price unless already in the summary.
+    - ✅ “NVDA may rise further [price not stated]” ← correct, preserves ambiguity.
+    - ❌ “10% upside implies a starting price of $222.60” ← inference not allowed.
+    - ✅ “Analyst sees 10% upside [base price not stated]” ← correct.
+
+    Only return the final formatted, validated summary. Do NOT include explanations, commentary, markdown wrappers, or surrounding text.
+
+    ---
+
+    Below is the AI-generated summary to validate:
+
     {text}
     """
+
         
     try:
         # Call OpenAI's API for summarization
@@ -566,63 +633,105 @@ def videoid_exists(video_id, table):
         print(f"Error checking video: {e}")
         return False
 
+def is_valid_youtube_video(item):
+    """Filter out livestreams, shorts, and podcast-like titles."""
+    snippet = item.get("snippet", {})
+    content_details = item.get("contentDetails", {})
 
-#50 channels, 3 recent videos per channel, every hour You do not need extract_flat=True
-#Use extract_flat=True only if You need to fetch 20+ videos per channel
-def get_recent_videos_from_channel_non_shorts(channel_url):
+    # SKIP Livestreams + Upcoming Videos
+    if snippet.get("liveBroadcastContent") in ("live", "upcoming"):
+        return False
 
-    max_results = 2
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": False,  # fetch full metadata
-        "playlistend": max_results,  # limit how many videos to fetch
-        "skip_download": True,
-        "socket_timeout": 10,
-        "retries": 1,
-        #"cookies": LOCAL_COOKIE_PATH, #Reference cookie created from download_cookie_from_s3 method
-        "no_warnings": True
+    # SKIP Shorts
+    try:
+        duration = content_details.get("duration", "PT0S")
+        if parse_duration(duration).total_seconds() <= 60:
+            return False
+    except Exception:
+        return False
+
+    # Optional: Filter podcast-like titles
+    title = snippet.get("title", "").lower()
+    if "podcast" in title:
+        return False
+
+    return True
+
+
+YOUTUBE_API_KEYS = [
+    "AIzaSyBsJ6lKZmXxeabhGTVv-68AMoYrgT5Ri6U",
+    "AIzaSyDZuewBaLxsJzkt3Z7tvbpQCCHEpxnObHg",
+    "AIzaSyDjcSlBDs5XzpDIlrZ6gAsuq76Pu-3UnEw",
+    "AIzaSyCfGn30LmlH0HRBYclJGQgHXFucOCs9LyI",
+    "AIzaSyBrPMXXSEmSAqj3OnsKH6evTQ190uJiCjA"
+]
+
+def get_rotating_api_key():
+    return random.choice(YOUTUBE_API_KEYS)
+
+def get_recent_videos_from_channel_non_shorts(channel_id):
+    api_key = get_rotating_api_key()
+
+    # Step 1: search.list – fetch top 3 most recent videos
+    search_url = "https://www.googleapis.com/youtube/v3/search"
+    search_params = {
+        "part": "id",
+        "channelId": channel_id,
+        "order": "date",
+        "maxResults": 2,
+        "type": "video",
+        "key": api_key
     }
 
+    search_resp = requests.get(search_url, params=search_params)
+    if search_resp.status_code != 200:
+        print(f"search.list failed: {search_resp.text}")
+        return []
+
+    items = search_resp.json().get("items", [])
+    video_ids = [item["id"]["videoId"] for item in items if "videoId" in item.get("id", {})]
+    if not video_ids:
+        print("No recent videos found.")
+        return []
+
+    # Step 2: videos.list – fetch full metadata
+    video_url = "https://www.googleapis.com/youtube/v3/videos"
+    video_params = {
+        "part": "snippet,contentDetails",
+        "id": ",".join(video_ids),
+        "key": api_key
+    }
+
+    video_resp = requests.get(video_url, params=video_params)
+    if video_resp.status_code != 200:
+        print(f"videos.list failed: {video_resp.text}")
+        return []
+
     results = []
-
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"{channel_url}/videos", download=False)
-            entries = info.get("entries", [])
-            time.sleep(random.uniform(0.5, 2))  # delay to avoid rate-limit
-    except Exception as e:
-        print(f"Failed to fetch video list from {channel_url}: {e}")
-        return results
-
-    for entry in entries:
-        if entry.get("is_live") or entry.get("live_status") in ("is_live", "upcoming"):
-            continue
-        if "/shorts/" in entry.get("webpage_url", ""):
+    for item in video_resp.json().get("items", []):
+        if not is_valid_youtube_video(item):
             continue
 
-        upload_date_str = entry.get("upload_date")
-        if not upload_date_str:
-            continue
-
-        try:
-            published_at = datetime.strptime(upload_date_str, "%Y%m%d").replace(tzinfo=timezone.utc).isoformat()
-        except ValueError:
-            continue
+        snippet = item["snippet"]
+        video_id = item["id"]
+        title = snippet.get("title")
+        published_at = snippet.get("publishedAt")
+        url = f"https://www.youtube.com/watch?v={video_id}"
 
         results.append({
-            "video_id": entry["id"],
-            "title": entry["title"],
-            "url": entry["webpage_url"],
+            "video_id": video_id,
+            "title": title,
+            "url": url,
             "published_at": published_at
         })
 
     return results
 
 #Fetches recent non-Shorts YouTube videos (not livestreams or Shorts) from a channel’s /videos page, filtering by upload date (last N days).
+#Not to be used for fargate usage. Used to load new channel.
+#Here I use yt_dlp because It will not cost youtube API Data.
+#Yt_dlp does not work with rotating proxy because I have to pay for https
 def get_recent_non_shorts_by_date(channel_url, number_of_days):
-    #LOCAL_PATH = "/tmp/youtube.com_cookies.txt"
-    #This is not really needed for prod job
 
     print(f"get_recent_non_shorts_by_date called: {channel_url}")
     cutoff = datetime.now() - timedelta(days=number_of_days)
@@ -660,7 +769,7 @@ def get_recent_non_shorts_by_date(channel_url, number_of_days):
 
         try:
             print(f"[{i+1}/{len(entries)}] Fetching: {entry['url']}")
-            time.sleep(random.uniform(1.5, 3.0))  # delay to avoid rate-limit
+            time.sleep(random.uniform(3, 5))  # delay to avoid rate-limit
 
             ydl_opts_full = {
                 "quiet": True,
@@ -749,16 +858,27 @@ def getChannel():
         print(f"DynamoDB query failed for querying channels: {e}")
         return {"statusCode": 500, "body": "DynamoDB query error for channels"}
 
+def ensure_latest_tools():
+    try:
+        subprocess.run(["pip", "install", "--upgrade", "yt-dlp", "youtube-transcript-api"], check=True, timeout=120)
+        print("✅ yt-dlp and youtube-transcript-api upgraded at runtime")
+    except subprocess.CalledProcessError as e:
+        print(f"⚠️ Runtime upgrade failed: {e}")
+
 def ingest_channel(channel_id, handle, fetchByTopVideos, fetchBynumberOfDays, count, total):
     """Fetches and processes the recent videos of a channel, summarizing their content."""
     
     url = "https://www.youtube.com/" + handle
     print(f"--------------------------------channel: {handle} begin. count:{count}/{total}--------------------------------")
     if(fetchByTopVideos):
-        videos = get_recent_videos_from_channel_non_shorts(url)
+        #for youtubedataAPI, pass channel_id
+        videos = get_recent_videos_from_channel_non_shorts(channel_id)
     else:
         videos = get_recent_non_shorts_by_date(url, fetchBynumberOfDays)
    
+    if not videos:
+        print(f"get recent videos from channel failed.")
+        return None
 
     # Initialize DynamoDB resource
     videoIdTable = dynamodb.Table('video_id_table')
@@ -766,7 +886,9 @@ def ingest_channel(channel_id, handle, fetchByTopVideos, fetchBynumberOfDays, co
     publishAtTable = dynamodb.Table('published_at_table')
     
     print(f"Looping over videos for channel: {handle} ")
+
     for video in videos:
+        time.sleep(random.uniform(1.5, 3.0))
         video_id=video['video_id']
         title = video['title']
 
@@ -812,8 +934,7 @@ def ingest_channel(channel_id, handle, fetchByTopVideos, fetchBynumberOfDays, co
             store_videoid_to_dynamoDB(video_id, published_at, channel_id, title, handle, videoIdTable)
             store_published_at_to_dynamoDB(video_id, published_at, channel_id, title, handle, publishAtTable)
             store_channelid_withsortkey_to_dynamoDB(channel_id, published_at, video_id, title, handle, channelIdTable)
-            print(f"===============>END VIDEO PROCESSING STAGE <==================")
-
+            
             '''
             testjson = {
                 'channel_id': channel_id,
@@ -842,14 +963,17 @@ def ingest_channel(channel_id, handle, fetchByTopVideos, fetchBynumberOfDays, co
     print(f"--------------------------------channel: {handle} processing end. count:{count}/{total}--------------------------------")
 
      
-
 def run_ingestion_job(event, context):
 
     # Parse the JSON body sent from API Gateway
     #body = json.loads(event.get("body", "{}"))
     #fetchByTopVideos = body.get("fetchByTopVideos")
     #fetchBynumberOfDays = body.get("fetchBynumberOfDays")
+    
+    #Update yt-dlp and youtube-transcript-api
+    ensure_latest_tools()
 
+    print(f"Version5 start")
     fetchByTopVideos = True
     fetchBynumberOfDays = -1
     channel_ids = []
@@ -897,7 +1021,7 @@ def run_ingestion_job(event, context):
         count += 1
 
     
-    current_timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    #current_timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     #save_test_data_to_s3(testjsonlist, 'transcript_prefilter_formatted', False, current_timestamp)
     #save_test_data_to_s3(justSummaries, 'all_formatted_summaries', True, current_timestamp)
     return {
